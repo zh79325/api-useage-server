@@ -1,0 +1,3 @@
+# 服务端为纯 Python 标准库实现（http.server + sqlite3），没有第三方依赖。
+# 本文件保留以便部署流程统一执行 `pip install -r requirements.txt`（正常成功，不装任何包）。
+# 若后续引入依赖，直接在下面追加即可。
