@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # 服务进程管理：./run.sh start|stop|restart|status|logs|foreground
-# 运行参数全走环境变量（无配置文件）：
+# 无配置文件、无鉴权，运行参数全走环境变量：
 #   API_USAGE_HOST(默认 0.0.0.0) / API_USAGE_PORT(默认 2697) /
-#   API_USAGE_DB(默认 ./data/api_usage.db) / API_USAGE_TOKEN(默认空 = 不校验)
-# 例：API_USAGE_TOKEN=xxx ./run.sh start
+#   API_USAGE_DB(默认 ./data/api_usage.db)
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -39,7 +38,7 @@ start() {
     return 0
   fi
   nohup "$PYTHON" server.py --host "$HOST" --port "$PORT" --db "$DB" \
-    --token "${API_USAGE_TOKEN:-}" >> "$LOG_FILE" 2>&1 &
+    >> "$LOG_FILE" 2>&1 &
   echo $! > "$PID_FILE"
   sleep 1
   if ! running_pid >/dev/null; then
@@ -80,7 +79,7 @@ case "${1:-status}" in
     fi ;;
   logs)    tail -f "$LOG_FILE" ;;
   foreground)
-    exec "$PYTHON" server.py --host "$HOST" --port "$PORT" --db "$DB" --token "${API_USAGE_TOKEN:-}" ;;
+    exec "$PYTHON" server.py --host "$HOST" --port "$PORT" --db "$DB" ;;
   *)
     echo "用法: ./run.sh start|stop|restart|status|logs|foreground" >&2
     exit 1 ;;

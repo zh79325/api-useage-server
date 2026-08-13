@@ -40,12 +40,11 @@ fi
 
 echo
 echo "初始化完成，接下来："
-echo "  ./run.sh start                              # 0.0.0.0:2697，不校验 token"
-echo "  API_USAGE_TOKEN=你的token ./run.sh start     # 带鉴权启动（公网必须带）"
+echo "  ./run.sh start                              # 0.0.0.0:2697（无鉴权，只在内网跑）"
 echo "  ./run.sh status                             # 查看状态与健康检查"
 echo
 echo "可用环境变量: API_USAGE_HOST(默认 0.0.0.0) / API_USAGE_PORT(默认 2697) /"
-echo "              API_USAGE_DB(默认 ./data/api_usage.db) / API_USAGE_TOKEN(默认不校验)"
+echo "              API_USAGE_DB(默认 ./data/api_usage.db)"
 echo
 echo "客户端（ai-skills/wx_gzh_article_writer/config/api_secrets.json → usage_server）填："
-echo "  { \"base_url\": \"http://<本机IP>:2697\", \"token\": \"启动时用的 token，没配就留空\", \"enabled\": true }"
+echo "  { \"base_url\": \"http://<本机IP>:2697\", \"enabled\": true }"

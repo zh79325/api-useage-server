@@ -9,7 +9,9 @@
   窗口变了自然是一条新记录，不需要清零逻辑
 - `quta`：该窗口已用次数；`limit` 为上限（0 表示只统计不拦截）
 
-写操作用 `BEGIN IMMEDIATE` 串行化，WAL 模式下允许多客户端并发读。
+对外只一个写入语义：`acquire()` = 「请求一次调用许可」，在同一个 `BEGIN IMMEDIATE`
+事务里完成「判定余额 + 扣减」，拿不到许可（`granted=false`）就是额度用完了；
+不存在「先查再记」的窗口期，多机器并发也不会超发。WAL 模式下允许多客户端并发读。
 """
 
 import hashlib
@@ -103,37 +105,45 @@ class UsageStore:
                     'limitKey': label, 'limit': 0, 'quta': 0}
         return _to_item(row)
 
-    def record(self, service: str, key_id: str, period: str,
-               max_calls: int = 0, delta: int = 1, key_mask: str = '') -> dict:
-        """记 delta 次调用（默认 +1），返回写后的当前窗口用量。"""
-        return self._write(service, key_id, period, max_calls, key_mask,
-                           lambda quta: quta + int(delta))
+    def acquire(self, service: str, key_id: str, period: str, max_calls: int = 0,
+                delta: int = 1, key_mask: str = '', exhausted: bool = False) -> dict:
+        """申请 delta 次调用许可：判定与扣减在同一事务里完成。
 
-    def exhaust(self, service: str, key_id: str, period: str,
-                max_calls: int = 0, key_mask: str = '') -> dict:
-        """把该 key 当前窗口直接标成满额（quta = max_calls）。
-
-        max_calls 为 0（只统计不拦截）时无法表达「满额」，保持原计数不动。
+        - 额度够：`quta += delta`，`granted=True`
+        - 额度不够：**不扣减**，`granted=False`（调用方据此直接换 key）
+        - `max_calls=0`（只统计不拦截）：永远批准，只累加计数
+        - `exhausted=True`：调用方从第三方接口得知该 key 已满/失效，把 `quta` 拉到
+          `max_calls` 并返回 `granted=False`（官方口径比本地计数准）
         """
-        if not max_calls:
-            return self.query(service, key_id, period)
         return self._write(service, key_id, period, max_calls, key_mask,
-                           lambda quta: max(quta, int(max_calls)))
+                           delta=int(delta), exhausted=bool(exhausted))
 
     def _write(self, service: str, key_id: str, period: str, max_calls: int,
-               key_mask: str, mutate) -> dict:
+               key_mask: str, delta: int, exhausted: bool) -> dict:
         label = window_label(period)
         now = datetime.now().isoformat(timespec='seconds')
         conn = self._connect()
         conn.execute('BEGIN IMMEDIATE')
         try:
             row = conn.execute(
-                'SELECT quta, key_mask FROM usage WHERE service=? AND key_id=? AND limit_key=?',
+                'SELECT quta, key_mask, max_calls FROM usage'
+                ' WHERE service=? AND key_id=? AND limit_key=?',
                 (service, key_id, label),
             ).fetchone()
-            old_quta = int(row['quta']) if row else 0
+            quta = int(row['quta']) if row else 0
             mask = key_mask or (row['key_mask'] if row else '') or ''
-            quta = max(0, int(mutate(old_quta)))
+            limit = int(max_calls or (row['max_calls'] if row else 0) or 0)
+
+            if exhausted:
+                # limit 为 0 时表达不了「满额」，保持原计数
+                quta = max(quta, limit)
+                granted = False
+            elif limit and quta + delta > limit:
+                granted = False
+            else:
+                quta += delta
+                granted = True
+
             conn.execute(
                 'INSERT INTO usage (service, key_id, limit_key, period, key_mask,'
                 ' max_calls, quta, updated_at) VALUES (?,?,?,?,?,?,?,?)'
@@ -141,14 +151,15 @@ class UsageStore:
                 ' quta=excluded.quta, max_calls=excluded.max_calls,'
                 ' key_mask=excluded.key_mask, period=excluded.period,'
                 ' updated_at=excluded.updated_at',
-                (service, key_id, label, period, mask, int(max_calls or 0), quta, now),
+                (service, key_id, label, period, mask, limit, quta, now),
             )
             conn.execute('COMMIT')
         except Exception:
             conn.execute('ROLLBACK')
             raise
-        return {'service': service, 'keyId': key_id, 'keyMask': mask,
-                'limitKey': label, 'limit': int(max_calls or 0), 'quta': quta}
+        return {'granted': granted, 'service': service, 'keyId': key_id, 'keyMask': mask,
+                'limitKey': label, 'limit': limit, 'quta': quta,
+                'remaining': max(limit - quta, 0) if limit else None}
 
     def snapshot(self, service: str, period: str) -> List[dict]:
         """某服务当前窗口内所有 key 的用量（按 quta 倒序）。"""

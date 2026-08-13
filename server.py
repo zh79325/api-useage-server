@@ -4,16 +4,17 @@
     ./init.sh          # 首次部署：自检 python3、建 data/logs 目录、跑自测
     ./run.sh start     # 启动/停止/重启/看日志：start|stop|restart|status|logs
     python3 server.py --host 0.0.0.0 --port 2697 --db /var/lib/api_usage.db
-无配置文件，参数只认命令行与环境变量：
-    API_USAGE_HOST / API_USAGE_PORT / API_USAGE_DB / API_USAGE_TOKEN
+无配置文件、无鉴权（只在内网/信任网络里跑），参数只认命令行与环境变量：
+    API_USAGE_HOST / API_USAGE_PORT / API_USAGE_DB
 
-接口（除 /health 外都要带 `Authorization: Bearer <token>`，未配 token 时不校验）：
-    GET  /health                  存活探测
-    POST /api/usage/query         查某 key 当前窗口用量
-    POST /api/usage/record        记一次调用（quta + delta）
-    POST /api/usage/exhaust       标记该 key 当前窗口满额
+接口一共四个，写入只有 acquire 这一个：
+    POST /api/usage/acquire       申请一次调用许可（判定+扣减同一事务）
     POST /api/usage/snapshot      某服务当前窗口全部 key 用量
     GET  /api/usage/all?rows=500  全部记账（含历史窗口）
+    GET  /health                  存活探测
+
+acquire 拿不到许可（`granted=false`）就是额度用完了；响应里带回 `quta`/`limit`/
+`remaining`，调用方直接拿去更新本地镜像，远程挂了也能继续拦。
 
 请求体统一为 JSON。key **只传 `keyId`（完整 key 的 md5）**，真实 key 不进请求也不落库；
 要人看得出是哪个 key 就额外传一个 `keyMask`（如 `RfhR***NkSj`）。
@@ -40,7 +41,6 @@ class UsageHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
     store: UsageStore = None  # 由 create_server 注入
-    token: str = ''
 
     def do_GET(self):
         path = urlparse(self.path).path.rstrip('/') or '/'
@@ -48,8 +48,6 @@ class UsageHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {'ok': True, 'db': self.store.db_path})
             return
         if path == '/api/usage/all':
-            if not self._check_token():
-                return
             query = parse_qs(urlparse(self.path).query)
             rows = self._as_int(query.get('rows', ['500'])[0], 500)
             self._send_json(HTTPStatus.OK, {'items': self.store.dump(min(max(rows, 1), 5000))})
@@ -59,16 +57,12 @@ class UsageHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path.rstrip('/') or '/'
         handlers = {
-            '/api/usage/query': self._handle_query,
-            '/api/usage/record': self._handle_record,
-            '/api/usage/exhaust': self._handle_exhaust,
+            '/api/usage/acquire': self._handle_acquire,
             '/api/usage/snapshot': self._handle_snapshot,
         }
         handler = handlers.get(path)
         if handler is None:
             self._send_json(HTTPStatus.NOT_FOUND, {'error': f"未知接口: {path}"})
-            return
-        if not self._check_token():
             return
         payload = self._read_json()
         if payload is None:
@@ -82,22 +76,14 @@ class UsageHandler(BaseHTTPRequestHandler):
 
     # ---- 业务处理 ----
 
-    def _handle_query(self, payload: dict) -> dict:
-        service, key_id, period, _, _ = _parse_key_args(payload)
-        return self.store.query(service, key_id, period)
-
-    def _handle_record(self, payload: dict) -> dict:
+    def _handle_acquire(self, payload: dict) -> dict:
         service, key_id, period, max_calls, key_mask = _parse_key_args(payload)
         delta = _parse_int(payload.get('delta'), 1, 'delta')
         if not 1 <= delta <= 1000:
             raise ValueError(f"delta 必须在 1~1000 之间，当前: {delta}")
-        return self.store.record(service, key_id, period, max_calls=max_calls,
-                                 delta=delta, key_mask=key_mask)
-
-    def _handle_exhaust(self, payload: dict) -> dict:
-        service, key_id, period, max_calls, key_mask = _parse_key_args(payload)
-        return self.store.exhaust(service, key_id, period, max_calls=max_calls,
-                                  key_mask=key_mask)
+        return self.store.acquire(service, key_id, period, max_calls=max_calls,
+                                  delta=delta, key_mask=key_mask,
+                                  exhausted=bool(payload.get('exhausted')))
 
     def _handle_snapshot(self, payload: dict) -> dict:
         service = _parse_str(payload.get('service'), 'service')
@@ -105,16 +91,6 @@ class UsageHandler(BaseHTTPRequestHandler):
         return {'items': self.store.snapshot(service, period)}
 
     # ---- 通用 ----
-
-    def _check_token(self) -> bool:
-        if not self.token:
-            return True
-        header = self.headers.get('Authorization') or ''
-        provided = header[7:].strip() if header.lower().startswith('bearer ') else ''
-        if provided == self.token:
-            return True
-        self._send_json(HTTPStatus.UNAUTHORIZED, {'error': 'token 无效或缺失'})
-        return False
 
     def _read_json(self):
         length = self._as_int(self.headers.get('Content-Length'), 0)
@@ -197,10 +173,10 @@ def _parse_key_args(payload: dict):
     return service, key_id, period, max_calls, key_mask
 
 
-def create_server(host: str, port: int, db_path: str, token: str = '') -> ThreadingHTTPServer:
-    """建好 HTTP 服务（未启动），store/token 挂在 handler 类上共享。"""
+def create_server(host: str, port: int, db_path: str) -> ThreadingHTTPServer:
+    """建好 HTTP 服务（未启动），store 挂在 handler 类上共享。"""
     store = UsageStore(db_path)
-    handler = type('BoundUsageHandler', (UsageHandler,), {'store': store, 'token': token})
+    handler = type('BoundUsageHandler', (UsageHandler,), {'store': store})
     httpd = ThreadingHTTPServer((host, port), handler)
     httpd.daemon_threads = True
     return httpd
@@ -213,13 +189,11 @@ def main(argv=None):
                         default=int(os.environ.get('API_USAGE_PORT', DEFAULT_PORT)))
     parser.add_argument('--db', default=os.environ.get(
         'API_USAGE_DB', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'api_usage.db')))
-    parser.add_argument('--token', default=os.environ.get('API_USAGE_TOKEN', ''),
-                        help='访问 token，留空则不校验')
     args = parser.parse_args(argv)
 
-    httpd = create_server(args.host, args.port, args.db, args.token)
-    print(f"[INFO] API 用量服务已启动: http://{args.host}:{args.port}  db={os.path.abspath(args.db)}"
-          f"  auth={'on' if args.token else 'off'}")
+    httpd = create_server(args.host, args.port, args.db)
+    print(f"[INFO] API 用量服务已启动: http://{args.host}:{args.port}"
+          f"  db={os.path.abspath(args.db)}")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
