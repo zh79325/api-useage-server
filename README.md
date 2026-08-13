@@ -1,11 +1,14 @@
 # api-useage-server
 
-轻量级 API 用量统计服务：给每个第三方 API key 按统计窗口（天/月）记账，多台机器 / 多个进程
-共用同一批 key 时不会把额度合并打穿。
+轻量级 API 用量控制服务：给每个第三方 API key 按统计窗口（天/月）**发调用许可**，多台机器 /
+多个进程共用同一批 key 时不会把额度合起来打穿。
+
+写入接口只有一个：`acquire`（判定余额 + 扣减在同一事务里）。**拿不到许可就是额度用完了**；
+响应带回 `quta`/`limit`/`remaining`，调用方直接覆写本地镜像，远程挂了本地也拦得住。
 
 **技术栈：纯 Python 标准库 —— HTTP 层 `http.server.ThreadingHTTPServer`（不用 Flask/FastAPI，
-不需 uvicorn/gunicorn），存储 `sqlite3` 单文件（WAL）。无第三方依赖，Python >= 3.8，
-拷到任何服务器上 `./init.sh && ./run.sh start` 就能跑。**
+不需 uvicorn/gunicorn），存储 `sqlite3` 单文件（WAL）。无第三方依赖、无配置文件、无鉴权，
+Python >= 3.8，拷到任何服务器上 `./init.sh && ./run.sh start` 就能跑。**
 
 ## 快速部署
 
@@ -57,33 +60,36 @@ Restart=always
 
 ## 接口
 
-请求体统一 JSON；除 `/health` 外都要带 `Authorization: Bearer <token>`（服务端未配 token 时不校验）。
-**key 只传 `keyId` = `md5(完整key)` 的32 位小写十六进制；传 `apiKey` 或非 md5 的 `keyId` 直接 400。**
+请求体统一 JSON，**无鉴权**（只在内网/信任网络里跑）。
+**key 只传 `keyId` = `md5(完整key)` 的 32 位小写十六进制；传 `apiKey` 或非 md5 的 `keyId` 直接 400。**
 
 | 方法 | 路径 | 入参 | 返回 |
 | --- | --- | --- | --- |
-| GET | `/health` | - | `{"ok": true, "db": "..."}` |
-| POST | `/api/usage/query` | `service` `keyId` `period` | `{"quta", "limit", "limitKey", "keyId", "keyMask"}` |
-| POST | `/api/usage/record` | 同上 + `maxCalls` `keyMask` `delta`(默认 1) | 同上（写后用量） |
-| POST | `/api/usage/exhaust` | 同上 + `maxCalls` | 同上（`quta` = `maxCalls`） |
+| POST | `/api/usage/acquire` | `service` `keyId` `period` `maxCalls` `keyMask` `delta`(默认1) `exhausted`(可选) | `{"granted", "quta", "limit", "remaining", "limitKey", "keyId", "keyMask"}` |
 | POST | `/api/usage/snapshot` | `service` `period` | `{"items": [{...}]}`，当前窗口全部 key |
 | GET | `/api/usage/all?rows=500` | - | `{"items": [{...}]}`，含历史窗口 |
+| GET | `/health` | - | `{"ok": true, "db": "..."}` |
 
-- `period` 只能是 `day` / `month`
-- `maxCalls` 为 0 时 `exhaust` 不改计数（无法表达「满额」）
-- 参数错 → 400，token 错 → 401，路径错 → 404，存储异常 → 500，返回体统一 `{"error": "..."}`
+acquire 语义：
+
+- 额度够 → `granted=true` 且 `quta += delta`
+- 额度不够 → `granted=false`，**不扣减**（`delta` 超过剩余时整批拒发，不留半截）
+- `maxCalls=0`（只统计不拦截）→ 永远批准，`remaining` 为 `null`
+- `exhausted=true` → 第三方实报额度用尽/key 失效时用，`quta` 拉到 `limit` 并返回 `granted=false`
+- 后续请求没带 `maxCalls` 也按已记录的上限判定
+- 参数错 → 400，路径错 → 404，存储异常 → 500，返回体统一 `{"error": "..."}`
 
 示例：
 
 ```bash
-TOKEN=启动时用的token
 KEY_ID=$(python3 -c "import hashlib;print(hashlib.md5(b'完整key').hexdigest())")
 
-curl -s -X POST http://127.0.0.1:2697/api/usage/record \
-  -H 'Content-Type: application/json' -H "Authorization: Bearer $TOKEN" \
+curl -s -X POST http://127.0.0.1:2697/api/usage/acquire \
+  -H 'Content-Type: application/json' \
   -d "{\"service\":\"byte_search_api_keys\",\"keyId\":\"$KEY_ID\",\"period\":\"month\",\"maxCalls\":500}"
+# {"granted": true, "quta": 1, "limit": 500, "remaining": 499, ...}
 
-curl -s http://127.0.0.1:2697/api/usage/all -H "Authorization: Bearer $TOKEN"
+curl -s http://127.0.0.1:2697/api/usage/all
 ```
 
 ## 客户端接入（ai-skills）
@@ -95,7 +101,6 @@ curl -s http://127.0.0.1:2697/api/usage/all -H "Authorization: Bearer $TOKEN"
 {
   "usage_server": {
     "base_url": "http://<服务器IP>:2697",
-    "token": "与服务端启动时的 API_USAGE_TOKEN 一致，未配则留空",
     "timeout_seconds": 2,
     "retry_interval_seconds": 60,
     "enabled": true
@@ -106,8 +111,8 @@ curl -s http://127.0.0.1:2697/api/usage/all -H "Authorization: Bearer $TOKEN"
 - 换服务器只改 `base_url`；不读环境变量、没有 CLI 入参，就这一处配置
 - `enabled: false` 或 `base_url` 留空 = 不启用远程，完全走本地文件
 - 客户端只上报 `md5(key)` 与掩码，真实 key 不出本机
-- 远程失败后 `retry_interval_seconds` 内不再重试（避免每次调用都白等一个超时）
-- 客户端实现：`scripts/tools/basic/usage_client.py`，回退逻辑在 `scripts/tools/basic/api_usage.py`
+- **本地镜像已满就不再请求远程**；远程失败后 `retry_interval_seconds` 内不再重试，期间按本地镜像判定
+- 客户端实现：`scripts/tools/basic/usage_client.py`，许可+镜像+回退在 `scripts/tools/basic/api_usage.py`
 
 ## 自测
 
