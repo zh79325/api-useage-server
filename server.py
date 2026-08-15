@@ -29,7 +29,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from store import PERIODS, UsageStore
+from store import UsageStore, normalize_period
 
 DEFAULT_PORT = 2697
 MAX_BODY_BYTES = 64 * 1024
@@ -141,10 +141,11 @@ def _parse_str(raw, field: str) -> str:
 
 
 def _parse_period(raw) -> str:
-    period = str(raw or 'day').strip()
-    if period not in PERIODS:
-        raise ValueError(f"period 只能是 {PERIODS}，当前: {period}")
-    return period
+    """校验并归一 period；语法与 store.normalize_period 同一处实现。
+
+    支持 `day` / `month` / `day+nH`（如 `day+11H` = 每天 11:00 切窗口）。
+    """
+    return normalize_period(raw or 'day')
 
 
 def _parse_int(raw, default: int, field: str) -> int:

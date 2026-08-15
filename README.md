@@ -54,7 +54,7 @@ Restart=always
 | `service` | 服务标识，与调用方 `api_secrets.json` 的字段名一致，如 `byte_search_api_keys` |
 | `key_id` | **完整 key 的 md5**（调用方本地算）；真实 key 不进请求、不进日志、不落库 |
 | `key_mask` | `RfhR***NkSj`，只用于展示（可不传） |
-| `limit_key` | 统计窗口：`period=day` → `YYYY-MM-DD`，`period=month` → `YYYY-MM`。换窗口即新记录，无需清零 |
+| `limit_key` | 统计窗口：`period=day` → `YYYY-MM-DD`，`period=month` → `YYYY-MM`，`period=day+11H` → `YYYY-MM-DD+11H`（取窗口起始日）。换窗口即新记录，无需清零 |
 | `limit` | 配置上限（0 = 只统计不拦截），上限 1e12 |
 | `quta` | 该窗口已用量（可以是调用次数，也可以是 token 数）|
 

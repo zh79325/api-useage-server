@@ -9,11 +9,13 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from server import create_server  # noqa: E402
-from store import UsageStore, key_id_of, mask_key, window_label  # noqa: E402
+from store import (UsageStore, day_offset_of, key_id_of, mask_key,  # noqa: E402
+                   normalize_period, window_label)
 
 
 class ServerTestCase(unittest.TestCase):
@@ -160,11 +162,29 @@ class ServerTestCase(unittest.TestCase):
     def test_bad_request(self):
         for payload in ({'keyId': key_id_of('k')},
                         {'service': 's', 'keyId': key_id_of('k'), 'period': 'week'},
+                        {'service': 's', 'keyId': key_id_of('k'), 'period': 'day+24H'},
+                        {'service': 's', 'keyId': key_id_of('k'), 'period': 'day+H'},
                         {'service': 's', 'period': 'day'},
                         {'service': 's', 'keyId': key_id_of('k'), 'period': 'day', 'delta': 0}):
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 self.post('/api/usage/acquire', payload)
             self.assertEqual(400, ctx.exception.code)
+
+    def test_day_offset_period_over_http(self):
+        """`day+11H` 走完整 HTTP 链路：落库 limit_key 带后缀，snapshot 能查回。"""
+        key_id = key_id_of('http-offset')
+        _, body = self.post('/api/usage/acquire', {
+            'service': 'svc-http', 'keyId': key_id, 'period': 'day+11h',
+            'maxCalls': 1800000, 'delta': 700,
+        })
+        self.assertTrue(body['granted'])
+        self.assertEqual(700, body['quta'])
+        self.assertTrue(body['limitKey'].endswith('+11H'), body['limitKey'])
+
+        _, snap = self.post('/api/usage/snapshot',
+                            {'service': 'svc-http', 'period': 'day+11H'})
+        self.assertEqual([key_id], [item['keyId'] for item in snap['items']])
+        self.assertEqual('day+11H', snap['items'][0]['period'], '归一后的 period 落库')
 
     def test_removed_endpoints(self):
         """record / exhaust / query 已合并进 acquire，路径不再存在。"""
@@ -225,8 +245,70 @@ class StoreTestCase(unittest.TestCase):
         self.assertEqual(32, len(key_id_of('some-key')))
 
     def test_window_label_invalid_period(self):
-        with self.assertRaises(ValueError):
-            window_label('week')
+        for bad in ('week', 'day+24H', 'day+H', 'day+11', ''):
+            with self.assertRaises(ValueError):
+                window_label(bad)
+
+    def test_normalize_period_day_offset(self):
+        """`day+nH` 归一：大小写不敏感、前导零去掉（否则同一份额度记两条账）。
+
+        与调用方 ai-skills 的 tools/basic/api_usage.normalize_period 必须完全一致。
+        """
+        self.assertEqual('day', normalize_period('day'))
+        self.assertEqual('month', normalize_period('month'))
+        self.assertEqual('day+11H', normalize_period('day+11H'))
+        self.assertEqual('day+11H', normalize_period('day+11h'))
+        self.assertEqual('day+9H', normalize_period('day+09H'))
+        self.assertEqual('day+0H', normalize_period('day+0H'))
+        self.assertEqual('day+23H', normalize_period('day+23H'))
+        self.assertEqual(11, day_offset_of('day+11H'))
+        self.assertIsNone(day_offset_of('day'))
+        self.assertIsNone(day_offset_of('month'))
+
+    def test_window_label_day_offset_boundary(self):
+        """窗口标识取起始日，11 点分界；期望值与客户端测试里硬编码的一致。"""
+        cases = [
+            (datetime(2026, 8, 16, 10, 59), '2026-08-15+11H'),
+            (datetime(2026, 8, 16, 11, 0), '2026-08-16+11H'),
+            (datetime(2026, 8, 16, 23, 59), '2026-08-16+11H'),
+            (datetime(2026, 8, 16, 0, 0), '2026-08-15+11H'),
+        ]
+        for now, expect in cases:
+            self.assertEqual(expect, window_label('day+11H', now=now), now)
+        # 与自然日 label 不同名：调用方切 period 后旧记录不会被当成本窗口
+        self.assertEqual('2026-08-16', window_label('day', now=datetime(2026, 8, 16, 12, 0)))
+
+    def test_day_offset_window_isolation(self):
+        """偏移窗口下旧窗口记录不影响当前窗口，且与自然日记录各记一条。"""
+        key_id = key_id_of('k-offset')
+        self.store.acquire('svc', key_id, 'day+11H', max_calls=1800000, delta=700)
+        current = window_label('day+11H')
+        self.assertEqual(700, self.store.query('svc', key_id, 'day+11H')['quta'])
+        self.assertEqual(current, self.store.query('svc', key_id, 'day+11H')['limitKey'])
+        self.assertTrue(current.endswith('+11H'), current)
+
+        # 上一个偏移窗口打满，不影响当前窗口
+        with self.store._connect() as conn:
+            conn.execute('INSERT INTO usage (service, key_id, limit_key, period, key_mask,'
+                         ' max_calls, quta, updated_at) VALUES (?,?,?,?,?,?,?,?)',
+                         ('svc', key_id, '1999-01-01+11H', 'day+11H', '',
+                          1800000, 1800000, 'x'))
+        self.assertEqual(700, self.store.query('svc', key_id, 'day+11H')['quta'])
+
+        # 自然日与 day+11H 是两条独立的账（label 不同名）
+        self.store.acquire('svc', key_id, 'day', max_calls=1800000, delta=5)
+        self.assertEqual(5, self.store.query('svc', key_id, 'day')['quta'])
+        self.assertEqual(700, self.store.query('svc', key_id, 'day+11H')['quta'])
+
+    def test_day_offset_snapshot(self):
+        """snapshot 按偏移窗口取当前窗口的条目，period 原样带回。"""
+        key_id = key_id_of('k-snap')
+        self.store.acquire('svc-snap', key_id, 'day+11H', max_calls=100, delta=3)
+        items = self.store.snapshot('svc-snap', 'day+11H')
+        self.assertEqual(1, len(items), items)
+        self.assertEqual('day+11H', items[0]['period'])
+        self.assertEqual(window_label('day+11H'), items[0]['limitKey'])
+        self.assertEqual([], self.store.snapshot('svc-snap', 'day'), '自然日窗口下查不到')
 
 
 if __name__ == '__main__':
