@@ -55,8 +55,8 @@ Restart=always
 | `key_id` | **完整 key 的 md5**（调用方本地算）；真实 key 不进请求、不进日志、不落库 |
 | `key_mask` | `RfhR***NkSj`，只用于展示（可不传） |
 | `limit_key` | 统计窗口：`period=day` → `YYYY-MM-DD`，`period=month` → `YYYY-MM`。换窗口即新记录，无需清零 |
-| `limit` | 配置上限（0 = 只统计不拦截） |
-| `quta` | 该窗口已用次数 |
+| `limit` | 配置上限（0 = 只统计不拦截），上限 1e12 |
+| `quta` | 该窗口已用量（可以是调用次数，也可以是 token 数）|
 
 ## 接口
 
@@ -74,6 +74,7 @@ acquire 语义：
 
 - 额度够 → `granted=true` 且 `quta += delta`
 - 额度不够 → `granted=false`，**不扣减**（`delta` 超过剩余时整批拒发，不留半截）
+- `delta` 取值 `1~100000000`（1 亿），`maxCalls` 上限 `1e12`：按次记账传 1，按 token 记账直接传本次消耗的 token 数
 - `maxCalls=0`（只统计不拦截）→ 永远批准，`remaining` 为 `null`
 - `exhausted=true` → 第三方实报额度用尽/key 失效时用，`quta` 拉到 `limit` 并返回 `granted=false`
 - 后续请求没带 `maxCalls` 也按已记录的上限判定

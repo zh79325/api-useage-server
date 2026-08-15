@@ -33,6 +33,10 @@ from store import PERIODS, UsageStore
 
 DEFAULT_PORT = 2697
 MAX_BODY_BYTES = 64 * 1024
+# 一次 acquire 最多申请多少用量：token 计费按百万级算，留到 1 亿
+MAX_DELTA = 100_000_000
+# 窗口上限（maxCalls）同量级放开，token 月配额动辄千万级
+MAX_QUOTA = 1_000_000_000_000
 _MD5_PATTERN = re.compile(r'^[0-9a-f]{32}$')
 
 
@@ -79,8 +83,8 @@ class UsageHandler(BaseHTTPRequestHandler):
     def _handle_acquire(self, payload: dict) -> dict:
         service, key_id, period, max_calls, key_mask = _parse_key_args(payload)
         delta = _parse_int(payload.get('delta'), 1, 'delta')
-        if not 1 <= delta <= 1000:
-            raise ValueError(f"delta 必须在 1~1000 之间，当前: {delta}")
+        if not 1 <= delta <= MAX_DELTA:
+            raise ValueError(f"delta 必须在 1~{MAX_DELTA} 之间，当前: {delta}")
         return self.store.acquire(service, key_id, period, max_calls=max_calls,
                                   delta=delta, key_mask=key_mask,
                                   exhausted=bool(payload.get('exhausted')))
@@ -166,6 +170,8 @@ def _parse_key_args(payload: dict):
     service = _parse_str(payload.get('service'), 'service')
     period = _parse_period(payload.get('period'))
     max_calls = _parse_int(payload.get('maxCalls'), 0, 'maxCalls')
+    if max_calls > MAX_QUOTA:
+        raise ValueError(f"maxCalls 不能超过 {MAX_QUOTA}，当前: {max_calls}")
     key_mask = str(payload.get('keyMask') or '').strip()
     key_id = _parse_str(payload.get('keyId'), 'keyId（完整 key 的 md5）').lower()
     if not _MD5_PATTERN.match(key_id):

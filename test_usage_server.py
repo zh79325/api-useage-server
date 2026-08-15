@@ -88,6 +88,30 @@ class ServerTestCase(unittest.TestCase):
             self.assertEqual(expected, body['quta'])
             self.assertIsNone(body['remaining'])
 
+    def test_token_scale_delta_and_limit(self):
+        """token 场景：百万级 delta / 千万级 maxCalls 正常记账。"""
+        args = ('token_svc', 'token-key', 'month', 5_000_000)
+        body = self.acquire(*args, delta=1861)
+        self.assertTrue(body['granted'], body)
+        self.assertEqual(1861, body['quta'])
+
+        body = self.acquire(*args, delta=3_000_000)
+        self.assertTrue(body['granted'], body)
+        self.assertEqual(3_001_861, body['quta'])
+        self.assertEqual(5_000_000 - 3_001_861, body['remaining'])
+
+        denied = self.acquire(*args, delta=2_000_000)
+        self.assertFalse(denied['granted'], denied)
+        self.assertEqual(3_001_861, denied['quta'])
+
+    def test_delta_over_hard_cap_is_rejected(self):
+        """超过硬上限的 delta 仍然 400，防止误传天文数字打爆额度。"""
+        payload = {'service': 's', 'keyId': key_id_of('k'), 'period': 'day',
+                   'delta': 100_000_001}
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post('/api/usage/acquire', payload)
+        self.assertEqual(400, ctx.exception.code)
+
     def test_exhausted_marks_full(self):
         """第三方实报额度用尽：拉满并拒发，后续 acquire 也拒发。"""
         args = ('baidu_search_api_keys', 'dead-key', 'day', 500)
